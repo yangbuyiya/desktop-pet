@@ -1,42 +1,28 @@
 {
-  "name": "desktop-pet",
-  "version": "0.1.1",
-  "description": "Standalone desktop pet with a local state API for future agent hooks.",
+  "name": "taskpet",
+  "version": "0.1.0-p0",
+  "description": "Local-first desktop task assistant shell with a persistent animated pet.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
+    "smoke": "electron . --smoke-test",
     "build": "npm test && electron-builder --dir",
     "build:unpack": "electron-builder --dir",
     "build:win": "electron-builder --win --publish never",
     "build:mac": "electron-builder --mac --universal --publish never",
-    "release:version": "npm version patch --no-git-tag-version",
-    "test": "node --test",
-    "hooks:doctor": "node src/hook-installer.js doctor",
-    "hooks:preview": "node src/hook-installer.js preview",
-    "hooks:install": "node src/hook-installer.js install",
-    "hooks:uninstall": "node src/hook-installer.js uninstall"
+    "test": "node --test"
   },
   "keywords": [
+    "taskpet",
     "desktop-pet",
-    "agent-hooks",
+    "task-assistant",
     "electron"
   ],
-  "author": "yangbuyiya",
-  "repository": {
-    "type": "git",
-    "url": "git+ssh://git@github.com/yangbuyiya/desktop-pet.git"
-  },
-  "bugs": {
-    "url": "https://github.com/yangbuyiya/desktop-pet/issues"
-  },
-  "homepage": "https://github.com/yangbuyiya/desktop-pet#readme",
+  "author": "TaskPet contributors",
   "license": "MIT",
   "devDependencies": {
     "electron": "28.2.9",
     "electron-builder": "^24.13.3"
-  },
-  "dependencies": {
-    "electron-updater": "^6.8.3"
   }
 }

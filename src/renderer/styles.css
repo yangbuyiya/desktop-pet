@@ -194,22 +194,21 @@ body {
   animation: idle-bob 2.4s ease-in-out infinite;
 }
 
-.pet[data-state="waving"],
-.pet[data-state="jumping"] {
+.pet[data-state="attention"],
+.pet[data-state="done"] {
   animation: hop 900ms ease-in-out infinite;
 }
 
-.pet[data-state="running"],
-.pet[data-state="review"] {
+.pet[data-state="working"] {
   animation: work-bob 640ms ease-in-out infinite;
 }
 
-.pet[data-state="waiting"] {
-  animation: waiting-tilt 1.2s ease-in-out infinite;
+.pet[data-state="drag-left"] {
+  transform: rotate(-2deg);
 }
 
-.pet[data-state="failed"] {
-  animation: failed-shake 420ms ease-in-out infinite;
+.pet[data-state="drag-right"] {
+  transform: rotate(2deg);
 }
 
 @keyframes idle-bob {
@@ -225,17 +224,6 @@ body {
 @keyframes work-bob {
   0%, 100% { transform: translateX(-2px) rotate(-1.5deg); }
   50% { transform: translateX(2px) rotate(1.5deg); }
-}
-
-@keyframes waiting-tilt {
-  0%, 100% { transform: rotate(-3deg); }
-  50% { transform: rotate(4deg); }
-}
-
-@keyframes failed-shake {
-  0%, 100% { transform: translateX(0); }
-  25% { transform: translateX(-4px); }
-  75% { transform: translateX(4px); }
 }
 
 @keyframes fallback-idle {

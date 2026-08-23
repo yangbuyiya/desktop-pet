@@ -1,4 +1,0 @@
-provider: github
-owner: yangbuyiya
-repo: desktop-pet
-updaterCacheDirName: desktop-pet-agent-updater

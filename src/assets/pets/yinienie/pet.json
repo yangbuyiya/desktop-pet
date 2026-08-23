@@ -2,5 +2,11 @@
     "id":  "yinienie",
     "displayName":  "yinienie",
     "description":  "像素风小黑猫 Codex 电子宠物，傲娇但靠谱，发现问题会直接提醒。",
-    "spritesheetPath":  "spritesheet.webp"
+    "spritesheetPath":  "spritesheet.webp",
+    "frame":  {
+        "width":  192,
+        "height":  208,
+        "columns":  8,
+        "rows":  9
+    }
 }

@@ -1,132 +1,41 @@
-const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, screen, shell, dialog } = require("electron");
-const { autoUpdater } = require("electron-updater");
+const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, shell } = require("electron");
 const fs = require("node:fs");
-const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { AGENTS, buildDecision } = require("./agent-events");
-const { AGENT_CONFIGS, doctorHooks, installHooks } = require("./hook-installer");
 const {
   discoverPets: discoverPetsInRoot,
   getActivePetsRoot,
   toPetPayload
 } = require("./pet-library");
-const { SessionManager } = require("./session-manager");
-const { ReminderManager } = require("./reminder-manager");
+const { PET_ACTIONS, PetStateController } = require("./pet-state");
+const {
+  BASE_WINDOW_HEIGHT,
+  BASE_WINDOW_WIDTH,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  clampZoom,
+  createPetWindowOptions
+} = require("./pet-window-options");
 
-const API_HOST = "127.0.0.1";
-const API_PORT = Number(process.env.PET_PORT || 17861);
+const APP_NAME = "TaskPet";
+const APP_ID = "com.taskpet.shell";
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const LOGO_PATH = path.join(__dirname, "assets", "logo.png");
 const BUNDLED_PETS_ROOT = path.join(__dirname, "assets", "pets");
-const RELEASES_URL = "https://github.com/yangbuyiya/desktop-pet/releases";
-const BASE_WINDOW_WIDTH = 240;
-const BASE_WINDOW_HEIGHT = 286;
-const MIN_ZOOM = 0.65;
-const MAX_ZOOM = 2.4;
-const MIN_BUBBLE_SCALE = 0.75;
-const MAX_BUBBLE_SCALE = 1.6;
-const MAX_BUBBLE_ITEMS = 3;
-const MAX_RECENT_HOOK_EVENTS = 40;
-const DEFAULT_ACTIVE_HOOK_AGENT = "codex";
-const REVIEW_AFTER_RUNNING_DEBOUNCE_MS = 1400;
+const IS_SMOKE_TEST = process.argv.includes("--smoke-test");
 
-const VALID_STATES = new Set([
-  "idle",
-  "running-right",
-  "running-left",
-  "waving",
-  "jumping",
-  "failed",
-  "waiting",
-  "running",
-  "review",
-  "start",
-  "remind",
-  "success",
-  "done",
-  "sleeping",
-  "working",
-  "thinking"
-]);
-
-let win;
-let bubbleWin;
-let settingsWin;
-let tray;
-let server;
+let petWindow = null;
+let tray = null;
 let pets = [];
 let activePet = null;
 let settings = {};
-let stateBeforeDrag = null;
-let bubbleTimer = null;
-let agentReturnTimer = null;
-let agentReviewDebounceTimer = null;
-let pendingReviewDecision = null;
-let bubbleReady = false;
-let pendingBubblePayload = null;
-let updateCheckInProgress = false;
-let updateDownloadInProgress = false;
-let updateDownloaded = false;
-let updateInstallStarted = false;
-let updatePromptVisible = false;
-let pendingUpdateInfo = null;
-let reminderManager = null;
-let updateStatus = {
-  status: "idle",
-  message: "尚未检查更新",
-  version: app.getVersion(),
-  progress: 0,
-  releaseUrl: RELEASES_URL,
-  updatedAt: new Date().toISOString()
-};
-const agentSessions = new SessionManager();
-let recentHookEvents = [];
-let currentState = {
-  state: "idle",
-  normalizedState: "idle",
-  message: "Ready",
-  updatedAt: new Date().toISOString()
-};
+let smokeTimeout = null;
 
-const ACTIONS = [
-  { state: "idle", label: "idle 待机", row: 0, hookName: "idle" },
-  { state: "running-right", label: "向右拖拽移动", row: 1, hookName: "drag-right" },
-  { state: "running-left", label: "向左拖拽移动", row: 2, hookName: "drag-left" },
-  { state: "waving", label: "挥手/提醒", row: 3, hookName: "remind" },
-  { state: "jumping", label: "done 开心跳一下", row: 4, hookName: "done" },
-  { state: "failed", label: "sleeping 趴下睡觉", row: 5, hookName: "sleeping" },
-  { state: "waiting", label: "waiting 等待输入", row: 6, hookName: "waiting" },
-  { state: "running", label: "working 敲代码中", row: 7, hookName: "working" },
-  { state: "review", label: "thinking 歪头思考", row: 8, hookName: "thinking" }
-];
+const petState = new PetStateController({
+  onChange: (state) => broadcastPetState(state)
+});
 
-const STATE_ALIASES = {
-  start: "waving",
-  remind: "waving",
-  success: "jumping",
-  done: "jumping",
-  sleeping: "failed",
-  working: "running",
-  thinking: "review"
-};
-
-function normalizeState(state) {
-  const requested = String(state || "idle");
-  return STATE_ALIASES[requested] || requested;
-}
-
-function clampZoom(zoom) {
-  const value = Number(zoom);
-  if (!Number.isFinite(value)) return 1;
-  return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
-}
-
-function clampBubbleScale(scale) {
-  const value = Number(scale);
-  if (!Number.isFinite(value)) return 1;
-  return Math.max(MIN_BUBBLE_SCALE, Math.min(MAX_BUBBLE_SCALE, value));
-}
+app.setName(APP_NAME);
 
 function readJson(filePath) {
   try {
@@ -134,19 +43,6 @@ function readJson(filePath) {
   } catch {
     return null;
   }
-}
-
-function createAppIcon() {
-  try {
-    const image = nativeImage.createFromPath(LOGO_PATH);
-    if (!image.isEmpty()) return image;
-  } catch (error) {
-    console.warn(`Failed to load app logo: ${error.message}`);
-  }
-
-  return nativeImage.createFromDataURL(
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAGFBMVEUAAAAYIi9i5v9y8qaZfP/90WYfKz2xyNj28m6BAAAAB3RSTlMA///f39+fn6uU/gAAAEFJREFUeNqVj0kOwCAIBQO//2XnplkYQYJGk0BHyDKJg1xmEAjJQWYNZUdGgTYosAkfiBPwYQnKN3qHf6Snw6gudTW2DdqgAhoBA3kwAAAAAElFTkSuQmCC"
-  );
 }
 
 function getSettingsPath() {
@@ -162,1211 +58,182 @@ function saveSettings() {
     fs.mkdirSync(path.dirname(getSettingsPath()), { recursive: true });
     fs.writeFileSync(getSettingsPath(), JSON.stringify(settings, null, 2));
   } catch (error) {
-    console.warn(`Failed to save settings: ${error.message}`);
+    console.warn(`Failed to save TaskPet settings: ${error.message}`);
   }
+}
+
+function createAppIcon() {
+  try {
+    const image = nativeImage.createFromPath(LOGO_PATH);
+    if (!image.isEmpty()) return image;
+  } catch (error) {
+    console.warn(`Failed to load TaskPet icon: ${error.message}`);
+  }
+
+  return nativeImage.createFromDataURL(
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAGFBMVEUAAAAYIi9i5v9y8qaZfP/90WYfKz2xyNj28m6BAAAAB3RSTlMA///f39+fn6uU/gAAAEFJREFUeNqVj0kOwCAIBQO//2XnplkYQYJGk0BHyDKJg1xmEAjJQWYNZUdGgTYosAkfiBPwYQnKN3qHf6Snw6gudTW2DdqgAhoBA3kwAAAAAElFTkSuQmCC"
+  );
+}
+
+function getPetStorageInfo() {
+  return getActivePetsRoot({ codexHome: CODEX_HOME, settings: {} });
 }
 
 function discoverPets() {
   const storage = getPetStorageInfo();
-  pets = discoverPetsInRoot(storage.petsRoot, { bundledPetsRoot: BUNDLED_PETS_ROOT });
-  const preferred = process.env.PET_ID || settings.activePetKey;
-  activePet = pets.find((pet) => pet.id === preferred || pet.key === preferred) || pets[0] || null;
+  const preferred = process.env.TASKPET_PET_ID
+    || process.env.PET_ID
+    || settings.activePetKey
+    || activePet?.key;
+
+  pets = discoverPetsInRoot(storage.petsRoot, {
+    bundledPetsRoot: BUNDLED_PETS_ROOT
+  });
+  activePet = pets.find((pet) => pet.id === preferred || pet.key === preferred)
+    || pets[0]
+    || null;
 }
 
-function getPetStorageInfo() {
-  return getActivePetsRoot({
-    codexHome: CODEX_HOME,
-    settings
-  });
-}
-
-function createWindow() {
-  const savedBounds = settings.windowBounds || {};
-  const zoom = clampZoom(settings.zoom || 1);
-  win = new BrowserWindow({
-    width: Math.round(BASE_WINDOW_WIDTH * zoom),
-    height: Math.round(BASE_WINDOW_HEIGHT * zoom),
-    x: Number.isFinite(savedBounds.x) ? savedBounds.x : 40,
-    y: Number.isFinite(savedBounds.y) ? savedBounds.y : 220,
-    frame: false,
-    transparent: true,
-    resizable: false,
-    movable: true,
-    show: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    hasShadow: false,
-    icon: createAppIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  win.setAlwaysOnTop(true, "floating");
-  win.loadFile(path.join(__dirname, "renderer", "index.html"));
-  win.once("ready-to-show", () => win.show());
-  win.on("closed", () => {
-    win = null;
-  });
-}
-
-function createBubbleWindow() {
-  bubbleReady = false;
-  bubbleWin = new BrowserWindow({
-    width: 280,
-    height: 96,
-    frame: false,
-    transparent: true,
-    resizable: false,
-    movable: false,
-    show: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    hasShadow: false,
-    focusable: false,
-    icon: createAppIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  bubbleWin.setAlwaysOnTop(true, "floating");
-  bubbleWin.setIgnoreMouseEvents(true);
-  bubbleWin.loadFile(path.join(__dirname, "renderer", "bubble.html"));
-  bubbleWin.webContents.once("did-finish-load", () => {
-    bubbleReady = true;
-    if (pendingBubblePayload) {
-      bubbleWin.webContents.send("bubble:set-message", pendingBubblePayload);
-      pendingBubblePayload = null;
-    }
-  });
-  bubbleWin.on("closed", () => {
-    bubbleWin = null;
-    bubbleReady = false;
-  });
-}
-
-function createSettingsWindow() {
-  if (settingsWin && !settingsWin.isDestroyed()) {
-    settingsWin.show();
-    settingsWin.focus();
-    return;
-  }
-
-  settingsWin = new BrowserWindow({
-    width: 880,
-    height: 680,
-    minWidth: 760,
-    minHeight: 560,
-    title: "Desktop Pet Agent Settings",
-    show: false,
-    icon: createAppIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  settingsWin.loadFile(path.join(__dirname, "renderer", "settings.html"));
-  settingsWin.once("ready-to-show", () => settingsWin.show());
-  settingsWin.on("closed", () => {
-    settingsWin = null;
-  });
-}
-
-function sendToWindows(channel, payload) {
-  for (const target of [win, settingsWin]) {
-    if (target && !target.isDestroyed()) {
-      target.webContents.send(channel, payload);
-    }
-  }
-}
-
-function normalizeUpdateInfo(info = {}) {
+function petStatePayload(state = petState.snapshot()) {
   return {
-    version: info.version || "",
-    releaseDate: info.releaseDate || "",
-    releaseName: info.releaseName || "",
-    releaseNotes: info.releaseNotes || ""
-  };
-}
-
-function setUpdateStatus(nextStatus) {
-  updateStatus = {
-    ...updateStatus,
-    ...nextStatus,
-    version: app.getVersion(),
-    releaseUrl: RELEASES_URL,
-    updatedAt: new Date().toISOString()
-  };
-  sendToWindows("pet:update-status", updateStatus);
-  return updateStatus;
-}
-
-function getUpdateStatus() {
-  return { ...updateStatus };
-}
-
-function configureDevUpdaterIfRequested() {
-  if (app.isPackaged) return true;
-  if (process.env.DESKTOP_PET_FORCE_DEV_UPDATE !== "1") return false;
-  autoUpdater.forceDevUpdateConfig = true;
-  autoUpdater.updateConfigPath = path.join(__dirname, "..", "dev-app-update.yml");
-  return true;
-}
-
-function isUpdateAvailableInThisRuntime(manual) {
-  if (configureDevUpdaterIfRequested()) return true;
-  if (manual) {
-    setUpdateStatus({
-      status: "disabled",
-      message: "开发模式不会检查自动更新，打包安装后可用",
-      progress: 0
-    });
-  }
-  return false;
-}
-
-function sendUpdateReadyPrompt(info) {
-  if (updatePromptVisible || updateInstallStarted) return;
-  updatePromptVisible = true;
-  const ownerWindow = settingsWin && !settingsWin.isDestroyed()
-    ? settingsWin
-    : (win && !win.isDestroyed() ? win : null);
-  const options = {
-    type: "info",
-    title: "更新已下载",
-    message: `Desktop Pet Agent ${info?.version || ""} 已下载完成`,
-    detail: "重启应用后会安装新版本。",
-    buttons: ["重启安装", "稍后"],
-    defaultId: 0,
-    cancelId: 1
-  };
-  const prompt = ownerWindow
-    ? dialog.showMessageBox(ownerWindow, options)
-    : dialog.showMessageBox(options);
-
-  prompt.then((result) => {
-    updatePromptVisible = false;
-    if (result.response === 0) installDownloadedUpdate();
-  }).catch((error) => {
-    updatePromptVisible = false;
-    console.warn(`Failed to show update prompt: ${error.message}`);
-  });
-}
-
-function setupAutoUpdater() {
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
-
-  autoUpdater.on("checking-for-update", () => {
-    setUpdateStatus({
-      status: "checking",
-      message: "正在检查更新...",
-      progress: 0
-    });
-  });
-
-  autoUpdater.on("update-available", (info) => {
-    pendingUpdateInfo = normalizeUpdateInfo(info);
-    updateCheckInProgress = false;
-    updateDownloadInProgress = true;
-    setUpdateStatus({
-      status: "downloading",
-      message: `发现新版本 ${pendingUpdateInfo.version || ""}，正在下载...`,
-      progress: 0,
-      updateInfo: pendingUpdateInfo
-    });
-  });
-
-  autoUpdater.on("update-not-available", () => {
-    updateCheckInProgress = false;
-    updateDownloadInProgress = false;
-    setUpdateStatus({
-      status: "latest",
-      message: "当前已是最新版本",
-      progress: 0
-    });
-  });
-
-  autoUpdater.on("download-progress", (progress) => {
-    const percent = Number(progress?.percent) || 0;
-    setUpdateStatus({
-      status: "downloading",
-      message: `正在下载更新 ${Math.round(percent)}%`,
-      progress: Math.max(0, Math.min(100, percent)),
-      transferred: progress?.transferred || 0,
-      total: progress?.total || 0,
-      bytesPerSecond: progress?.bytesPerSecond || 0,
-      updateInfo: pendingUpdateInfo
-    });
-  });
-
-  autoUpdater.on("update-downloaded", (info) => {
-    pendingUpdateInfo = normalizeUpdateInfo(info);
-    updateCheckInProgress = false;
-    updateDownloadInProgress = false;
-    updateDownloaded = true;
-    setUpdateStatus({
-      status: "ready",
-      message: `新版本 ${pendingUpdateInfo.version || ""} 已下载，重启后安装`,
-      progress: 100,
-      updateInfo: pendingUpdateInfo
-    });
-    sendUpdateReadyPrompt(pendingUpdateInfo);
-  });
-
-  autoUpdater.on("error", (error) => {
-    updateCheckInProgress = false;
-    updateDownloadInProgress = false;
-    setUpdateStatus({
-      status: "error",
-      message: error?.message || "自动更新检查失败",
-      progress: 0,
-      updateInfo: pendingUpdateInfo
-    });
-  });
-}
-
-async function checkForUpdates(manual = false) {
-  if (updateDownloaded) {
-    return setUpdateStatus({
-      status: "ready",
-      message: `新版本 ${pendingUpdateInfo?.version || ""} 已下载，重启后安装`,
-      progress: 100,
-      updateInfo: pendingUpdateInfo
-    });
-  }
-
-  if (updateCheckInProgress || updateDownloadInProgress) {
-    return setUpdateStatus({
-      status: updateDownloadInProgress ? "downloading" : "checking",
-      message: updateDownloadInProgress ? "更新正在下载中..." : "正在检查更新...",
-      updateInfo: pendingUpdateInfo
-    });
-  }
-
-  if (!isUpdateAvailableInThisRuntime(manual)) return getUpdateStatus();
-
-  updateCheckInProgress = true;
-  try {
-    await autoUpdater.checkForUpdates();
-  } catch (error) {
-    updateCheckInProgress = false;
-    return setUpdateStatus({
-      status: "error",
-      message: error?.message || "自动更新检查失败",
-      progress: 0
-    });
-  }
-
-  return getUpdateStatus();
-}
-
-function installDownloadedUpdate() {
-  if (!updateDownloaded || updateInstallStarted) return getUpdateStatus();
-  updateInstallStarted = true;
-  setUpdateStatus({
-    status: "installing",
-    message: "正在重启并安装更新...",
-    progress: 100,
-    updateInfo: pendingUpdateInfo
-  });
-  setImmediate(() => autoUpdater.quitAndInstall(true, true));
-  return getUpdateStatus();
-}
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function positionBubble(size = {}) {
-  if (!win || win.isDestroyed() || !bubbleWin || bubbleWin.isDestroyed()) return;
-
-  const petBounds = win.getBounds();
-  const display = screen.getDisplayMatching(petBounds);
-  const area = display.workArea;
-  const zoom = clampZoom(settings.zoom || 1);
-  const spriteScale = 0.86 * zoom;
-  const spriteWidth = 192 * spriteScale;
-  const spriteHeight = 208 * spriteScale;
-  const spriteLeft = 36 * zoom + 1 * zoom;
-  const spriteBottom = 12 * zoom;
-  const spriteTop = petBounds.y + petBounds.height - spriteBottom - spriteHeight;
-  const spriteCenterX = petBounds.x + spriteLeft + spriteWidth / 2;
-  const gap = 6;
-  const margin = 8;
-  const width = Math.ceil(Number(size.width) || 280);
-  const height = Math.ceil(Number(size.height) || 96);
-  const topY = spriteTop - height - gap;
-  const bottomY = spriteTop + spriteHeight + gap;
-
-  const x = clamp(
-    Math.round(spriteCenterX - width / 2),
-    area.x + margin,
-    area.x + area.width - width - margin
-  );
-  const y = Math.round(topY >= area.y + margin
-    ? topY
-    : clamp(bottomY, area.y + margin, area.y + area.height - height - margin));
-
-  bubbleWin.setBounds({ x, y, width, height });
-}
-
-function getAgentDisplayName(source) {
-  if (!source) return "";
-  return AGENTS[source]?.label || source;
-}
-
-function buildBubbleItems(state = currentState) {
-  const items = [];
-
-  if (state.message) {
-    items.push({
-      id: state.sessionId || "current",
-      source: state.source || "",
-      title: getAgentDisplayName(state.source),
-      state: normalizeState(state.state),
-      message: String(state.message).slice(0, 120),
-      persistent: Boolean(state.sessionId && state.source)
-    });
-  }
-
-  return items.slice(0, MAX_BUBBLE_ITEMS);
-}
-
-function showBubble(input) {
-  if (!bubbleWin || bubbleWin.isDestroyed()) return;
-  clearTimeout(bubbleTimer);
-  bubbleTimer = null;
-
-  const items = Array.isArray(input)
-    ? input
-    : (typeof input === "string" && input ? [{ message: input, persistent: false }] : []);
-
-  if (items.length === 0) {
-    bubbleWin.hide();
-    return;
-  }
-
-  const payload = {
-    message: items[0]?.message || "",
-    items,
-    bubbleScale: clampBubbleScale(settings.bubbleScale || 1)
-  };
-
-  positionBubble();
-  bubbleWin.showInactive();
-
-  if (bubbleReady) {
-    bubbleWin.webContents.send("bubble:set-message", payload);
-  } else {
-    pendingBubblePayload = payload;
-  }
-
-  if (!items.some((item) => item.persistent)) {
-    bubbleTimer = setTimeout(() => {
-      if (bubbleWin && !bubbleWin.isDestroyed()) bubbleWin.hide();
-    }, 4200);
-  }
-}
-
-function broadcastZoom() {
-  sendToWindows("pet:set-zoom", {
-    zoom: clampZoom(settings.zoom || 1),
-    bounds: win && !win.isDestroyed() ? win.getBounds() : null
-  });
-}
-
-function broadcastBubbleScale() {
-  sendToWindows("pet:set-bubble-scale", {
-    bubbleScale: clampBubbleScale(settings.bubbleScale || 1)
-  });
-  if (currentState.message || agentSessions.list().some((session) => session.message)) {
-    showBubble(buildBubbleItems(currentState));
-  }
-}
-
-function broadcastState(nextState) {
-  const requestedState = nextState.state || currentState.state;
-  const normalizedState = normalizeState(requestedState);
-  currentState = {
-    ...currentState,
-    ...nextState,
-    state: requestedState,
-    normalizedState,
-    updatedAt: new Date().toISOString()
-  };
-
-  sendToWindows("pet:set-state", {
-    ...currentState,
-    actions: ACTIONS,
+    ...state,
+    actions: PET_ACTIONS,
     activePet: toPetPayload(activePet)
-  });
-  showBubble(buildBubbleItems(currentState));
-}
-
-function broadcastAgentAggregate() {
-  const aggregate = agentSessions.getAggregate();
-  broadcastState({
-    state: aggregate.state,
-    message: aggregate.message,
-    source: aggregate.source,
-    sessionId: aggregate.sessionId,
-    agentEvent: "aggregate",
-    sessions: agentSessions.list()
-  });
-}
-
-function clearAgentReviewDebounce() {
-  if (agentReviewDebounceTimer) {
-    clearTimeout(agentReviewDebounceTimer);
-    agentReviewDebounceTimer = null;
-  }
-  pendingReviewDecision = null;
-}
-
-function shouldDebounceReviewDecision(decision) {
-  if (!decision || decision.terminal || decision.visualState) return false;
-  if (decision.persistentState !== "review") return false;
-  if (decision.event !== "tool_end" && decision.event !== "review") return false;
-  if (normalizeState(currentState.state) !== "running") return false;
-  if (currentState.source && decision.source && currentState.source !== decision.source) return false;
-  if (currentState.sessionId && decision.sessionId && currentState.sessionId !== decision.sessionId) return false;
-  return true;
-}
-
-function buildDeferredAgentResult(decision) {
-  const aggregate = agentSessions.getAggregate();
-  return {
-    deferred: true,
-    display: {
-      state: currentState.state,
-      message: currentState.message || aggregate.message || "",
-      source: currentState.source || decision.source,
-      sessionId: currentState.sessionId || decision.sessionId,
-      agentEvent: decision.event,
-      durationMs: 0,
-      returnState: aggregate
-    },
-    aggregate,
-    sessions: agentSessions.list()
   };
 }
 
-function commitAgentDecision(decision) {
-  if (agentReturnTimer) {
-    clearTimeout(agentReturnTimer);
-    agentReturnTimer = null;
-  }
-
-  const result = agentSessions.apply(decision);
-  broadcastState({
-    state: result.display.state,
-    message: result.display.message,
-    source: result.display.source,
-    sessionId: result.display.sessionId,
-    agentEvent: result.display.agentEvent,
-    sessions: result.sessions
-  });
-
-  if (result.display.durationMs > 0) {
-    agentReturnTimer = setTimeout(() => {
-      agentReturnTimer = null;
-      broadcastAgentAggregate();
-    }, result.display.durationMs);
-  }
-
-  return result;
+function sendToPetWindow(channel, payload) {
+  if (!petWindow || petWindow.isDestroyed()) return;
+  petWindow.webContents.send(channel, payload);
 }
 
-function applyAgentDecision(decision) {
-  if (shouldDebounceReviewDecision(decision)) {
-    clearAgentReviewDebounce();
-    pendingReviewDecision = decision;
-    agentReviewDebounceTimer = setTimeout(() => {
-      const queuedDecision = pendingReviewDecision;
-      clearAgentReviewDebounce();
-      if (queuedDecision) commitAgentDecision(queuedDecision);
-    }, REVIEW_AFTER_RUNNING_DEBOUNCE_MS);
-    return buildDeferredAgentResult(decision);
-  }
+function isPetWindowSender(event) {
+  return Boolean(
+    petWindow
+    && !petWindow.isDestroyed()
+    && event?.sender === petWindow.webContents
+  );
+}
 
-  clearAgentReviewDebounce();
-  return commitAgentDecision(decision);
+function broadcastPetState(state) {
+  sendToPetWindow("taskpet:state-changed", petStatePayload(state));
 }
 
 function broadcastPet() {
-  sendToWindows("pet:set-pet", toPetPayload(activePet));
+  sendToPetWindow("taskpet:pet-changed", toPetPayload(activePet));
 }
 
-function selectPet(idOrKey, source) {
-  const nextPet = pets.find((pet) => {
-    if (source && pet.source !== source) return false;
-    return pet.id === idOrKey || pet.key === idOrKey;
+function broadcastZoom() {
+  sendToPetWindow("taskpet:zoom-changed", {
+    zoom: clampZoom(settings.zoom),
+    bounds: petWindow && !petWindow.isDestroyed() ? petWindow.getBounds() : null
   });
+}
 
+function selectPet(key) {
+  const nextPet = pets.find((pet) => pet.key === key);
   if (!nextPet) return false;
+
   activePet = nextPet;
   settings.activePetKey = nextPet.key;
   saveSettings();
   broadcastPet();
+  rebuildTrayMenu();
   return true;
 }
 
-function selectPetStorage(storageId, customDir) {
-  const requested = String(storageId || "codex");
-  if (requested === "custom") {
-    if (!customDir && !settings.customPetsDir) {
-      return { ok: false, error: "请先选择自定义宠物文件夹", storage: getPetStorageInfo() };
-    }
-    if (customDir) settings.customPetsDir = path.resolve(String(customDir));
-  }
-  settings.petStorage = ["codex", "custom"].includes(requested) ? requested : "codex";
-  settings.activePetKey = "";
-  saveSettings();
+function reloadPets() {
   discoverPets();
   broadcastPet();
-  return {
-    ok: true,
-    storage: getPetStorageInfo(),
-    pets: pets.map(toPetPayload),
-    activePet: toPetPayload(activePet)
-  };
+  rebuildTrayMenu();
 }
 
-async function chooseCustomPetStorage() {
-  const result = await dialog.showOpenDialog(settingsWin || win, {
-    title: "选择宠物文件夹",
-    properties: ["openDirectory", "createDirectory"]
-  });
-  if (result.canceled || !result.filePaths[0]) {
-    return { ok: false, canceled: true, storage: getPetStorageInfo() };
+async function openCodexPetsFolder() {
+  const target = getPetStorageInfo().petsRoot;
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    const error = await shell.openPath(target);
+    if (error) console.warn(`Failed to open pet folder: ${error}`);
+  } catch (error) {
+    console.warn(`Failed to open pet folder: ${error.message}`);
   }
-  return selectPetStorage("custom", result.filePaths[0]);
 }
 
-async function openPetFolder(kind = "current") {
-  const storage = getPetStorageInfo();
-  const options = {
-    current: storage.petsRoot,
-    codex: storage.codexPetsRoot,
-    custom: storage.customPetsRoot
-  };
-  const target = options[kind] || options.current;
-  if (!target) return { ok: false, error: "目录尚未配置", storage };
-  fs.mkdirSync(target, { recursive: true });
-  const error = await shell.openPath(target);
-  return { ok: !error, error, path: target, storage };
-}
+function createPetWindow() {
+  petWindow = new BrowserWindow(createPetWindowOptions({
+    preloadPath: path.join(__dirname, "preload.js"),
+    icon: createAppIcon(),
+    savedBounds: settings.windowBounds,
+    zoom: settings.zoom
+  }));
 
-function buildInitialPayload() {
-  const storage = getPetStorageInfo();
-  return {
-    ...currentState,
-    normalizedState: normalizeState(currentState.state),
-    pets: pets.map(toPetPayload),
-    actions: ACTIONS,
-    activePet: toPetPayload(activePet),
-    config: {
-      apiBaseUrl: `http://${API_HOST}:${API_PORT}`,
-      petsRoot: storage.petsRoot,
-      petStorage: storage.petStorage,
-      petStorageOptions: storage.options,
-      codexPetsRoot: storage.codexPetsRoot,
-      customPetsRoot: storage.customPetsRoot,
-      bundledPetsRoot: BUNDLED_PETS_ROOT,
-      settingsPath: getSettingsPath(),
-      agents: AGENTS,
-      hookStatus: getHookStatus(),
-      activeHookAgent: getActiveHookAgent(),
-      zoom: clampZoom(settings.zoom || 1),
-      minZoom: MIN_ZOOM,
-      maxZoom: MAX_ZOOM,
-      bubbleScale: clampBubbleScale(settings.bubbleScale || 1),
-      minBubbleScale: MIN_BUBBLE_SCALE,
-      maxBubbleScale: MAX_BUBBLE_SCALE,
-      baseWindowWidth: BASE_WINDOW_WIDTH,
-      baseWindowHeight: BASE_WINDOW_HEIGHT,
-      appVersion: app.getVersion(),
-      releaseUrl: RELEASES_URL,
-      updateStatus: getUpdateStatus(),
-      reminderStatus: reminderManager ? reminderManager.getStatus() : null
-    }
-  };
-}
-
-function getHookStatus() {
-  const lastByAgent = getLastHookEventByAgent();
-  return Object.keys(AGENT_CONFIGS).map((agentId) => {
-    const result = doctorHooks(agentId);
-    const configuredCount = result.valid
-      ? AGENT_CONFIGS[agentId].events.length - result.missing.length
-      : 0;
-
-    return {
-      ...result,
-      totalEvents: AGENT_CONFIGS[agentId].events.length,
-      configuredCount,
-      lastEvent: lastByAgent[agentId] || null,
-      selected: agentId === getActiveHookAgent(),
-      state: result.status === "installed" ? "ok" : (result.status === "error" ? "error" : "missing"),
-      reason: describeHookStatus(result, configuredCount)
-    };
+  petWindow.setAlwaysOnTop(true, "floating");
+  petWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+  petWindow.once("ready-to-show", () => {
+    if (!IS_SMOKE_TEST) petWindow.show();
+  });
+  petWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription) => {
+    console.error(`TaskPet renderer failed to load (${errorCode}): ${errorDescription}`);
+    if (IS_SMOKE_TEST) app.exit(1);
+  });
+  petWindow.on("closed", () => {
+    petWindow = null;
   });
 }
 
-function normalizeHookAgent(agentId) {
-  const id = String(agentId || "").toLowerCase();
-  if (AGENT_CONFIGS[id]) return id;
-  return DEFAULT_ACTIVE_HOOK_AGENT;
-}
-
-function getActiveHookAgent() {
-  return normalizeHookAgent(settings.activeHookAgent || DEFAULT_ACTIVE_HOOK_AGENT);
-}
-
-function selectHookAgent(agentId) {
-  const activeHookAgent = normalizeHookAgent(agentId);
-  settings.activeHookAgent = activeHookAgent;
+function saveWindowBounds() {
+  if (!petWindow || petWindow.isDestroyed()) return;
+  settings.windowBounds = petWindow.getBounds();
   saveSettings();
-  agentSessions.clear();
-  clearAgentReviewDebounce();
-  broadcastState({ state: "idle", message: "", source: null, sessionId: null, agentEvent: "select-hook-agent", sessions: [] });
-  return {
-    ok: true,
-    activeHookAgent,
-    hooks: getHookStatus()
-  };
-}
-
-function recordHookEvent(decision) {
-  recentHookEvents = [
-    {
-      source: decision.source,
-      event: decision.event,
-      state: decision.visualState || decision.persistentState || "",
-      sessionId: decision.sessionId,
-      message: decision.message || "",
-      receivedAt: new Date().toISOString()
-    },
-    ...recentHookEvents
-  ].slice(0, MAX_RECENT_HOOK_EVENTS);
-}
-
-function getLastHookEventByAgent() {
-  const out = {};
-  for (const event of recentHookEvents) {
-    if (!event.source || out[event.source]) continue;
-    out[event.source] = event;
-  }
-  return out;
-}
-
-function describeHookStatus(result, configuredCount) {
-  if (result.status === "installed") return "已接入";
-  if (result.status === "error") return result.error || "配置文件无法解析";
-  if (result.invalidCommands > 0) return `有 ${result.invalidCommands} 个 hook 命令不是 Node，需要修复`;
-  if (result.codexFeature && result.codexFeature.enabled !== true) return "Codex hooks feature 未启用";
-  if (!result.exists) return "配置文件不存在，尚未安装 hook";
-  if (configuredCount > 0) return `缺少 ${result.missing.length} 个事件`;
-  return "未发现本项目管理的 hook";
-}
-
-function installHookAgent(agentId) {
-  const id = String(agentId || "").toLowerCase();
-  if (!AGENT_CONFIGS[id]) {
-    return { ok: false, error: `Unknown agent: ${agentId}`, hooks: getHookStatus() };
-  }
-
-  const result = installHooks(id);
-  return {
-    ok: true,
-    result: {
-      agent: result.agent,
-      changed: result.changed,
-      added: result.added,
-      removed: result.removed,
-      backupPath: result.backupPath || null,
-      settingsPath: result.settingsPath
-    },
-    hooks: getHookStatus()
-  };
 }
 
 function resizePetWindow(zoomInput) {
-  if (!win || win.isDestroyed()) return { ok: false };
+  if (!petWindow || petWindow.isDestroyed()) return { ok: false };
+
   const zoom = clampZoom(zoomInput);
-  const bounds = win.getBounds();
+  const bounds = petWindow.getBounds();
   const width = Math.round(BASE_WINDOW_WIDTH * zoom);
   const height = Math.round(BASE_WINDOW_HEIGHT * zoom);
-  win.setBounds({ x: bounds.x, y: bounds.y, width, height });
+  petWindow.setBounds({ x: bounds.x, y: bounds.y, width, height });
   settings.zoom = zoom;
-  settings.windowBounds = win.getBounds();
+  settings.windowBounds = petWindow.getBounds();
   saveSettings();
   broadcastZoom();
-  positionBubble();
-  return { ok: true, zoom, bounds: win.getBounds() };
+  return { ok: true, zoom, bounds: petWindow.getBounds() };
 }
 
-function resizeBubble(scaleInput) {
-  const bubbleScale = clampBubbleScale(scaleInput);
-  settings.bubbleScale = bubbleScale;
-  saveSettings();
-  broadcastBubbleScale();
-  return { ok: true, bubbleScale };
-}
+function petTrayItems() {
+  const items = pets.map((pet) => ({
+    label: `${pet.displayName} · ${pet.sourceLabel}`,
+    type: "radio",
+    checked: pet.key === activePet?.key,
+    click: () => selectPet(pet.key)
+  }));
 
-function getWindowPlacement() {
-  if (!win || win.isDestroyed()) return null;
-  const bounds = win.getBounds();
-  const display = screen.getDisplayMatching(bounds);
-  const workArea = display.workArea;
-  const edgeMargin = 48;
-
-  return {
-    bounds,
-    workArea,
-    nearLeft: bounds.x <= workArea.x + edgeMargin,
-    nearRight: bounds.x + bounds.width >= workArea.x + workArea.width - edgeMargin,
-    nearTop: bounds.y <= workArea.y + edgeMargin,
-    nearBottom: bounds.y + bounds.height >= workArea.y + workArea.height - edgeMargin
-  };
-}
-
-function parseJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let byteLength = 0;
-    req.on("data", (chunk) => {
-      chunks.push(chunk);
-      byteLength += chunk.length;
-      if (byteLength > 1024 * 64) {
-        reject(new Error("Request body too large"));
-        req.destroy();
-      }
-    });
-    req.on("end", () => {
-      const buffer = Buffer.concat(chunks);
-      const body = decodeRequestBody(buffer, req.headers["content-type"]);
-      if (!body.trim()) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(body));
-      } catch (error) {
-        reject(error);
-      }
-    });
-    req.on("error", reject);
-  });
-}
-
-function decodeRequestBody(buffer, contentType = "") {
-  const charset = String(contentType).match(/charset=([^;]+)/i)?.[1]?.trim().toLowerCase();
-
-  if (charset) {
-    try {
-      return new TextDecoder(charset).decode(buffer);
-    } catch {
-      // Fall through to tolerant defaults.
-    }
+  if (items.length === 0) {
+    items.push({ label: "未发现可用宠物", enabled: false });
   }
 
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
-  } catch {
-    return new TextDecoder("gb18030").decode(buffer);
-  }
-}
-
-function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  });
-  res.end(JSON.stringify(payload));
-}
-
-async function handleApiRequest(req, res) {
-  const url = new URL(req.url, `http://${API_HOST}:${API_PORT}`);
-
-  if (req.method === "OPTIONS") {
-    sendJson(res, 204, {});
-    return;
-  }
-
-  if (url.pathname === "/health") {
-    const storage = getPetStorageInfo();
-    sendJson(res, 200, {
-      ok: true,
-      state: currentState,
-      agentSessions: agentSessions.snapshot(),
-      actions: ACTIONS,
-      activePet: toPetPayload(activePet),
-      petsRoot: storage.petsRoot,
-      petStorage: storage.petStorage
-    });
-    return;
-  }
-
-  if (url.pathname === "/pets" && req.method === "GET") {
-    discoverPets();
-    sendJson(res, 200, {
-      ok: true,
-      actions: ACTIONS,
-      activePet: toPetPayload(activePet),
-      pets: pets.map(toPetPayload),
-      storage: getPetStorageInfo()
-    });
-    return;
-  }
-
-  if (url.pathname === "/pets/storage" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      const result = selectPetStorage(body.storage, body.customDir);
-      sendJson(res, result.ok ? 200 : 400, result);
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message, storage: getPetStorageInfo() });
-    }
-    return;
-  }
-
-  if (url.pathname === "/actions" && req.method === "GET") {
-    sendJson(res, 200, { ok: true, actions: ACTIONS });
-    return;
-  }
-
-  if (url.pathname === "/hooks/status" && req.method === "GET") {
-    sendJson(res, 200, { ok: true, hooks: getHookStatus() });
-    return;
-  }
-
-  if (url.pathname === "/hooks/install" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      const result = installHookAgent(body.agent);
-      sendJson(res, result.ok ? 200 : 400, result);
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message, hooks: getHookStatus() });
-    }
-    return;
-  }
-
-  if (url.pathname === "/hooks/select" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      sendJson(res, 200, selectHookAgent(body.agent));
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message, activeHookAgent: getActiveHookAgent(), hooks: getHookStatus() });
-    }
-    return;
-  }
-
-  if (url.pathname === "/sessions" && req.method === "GET") {
-    sendJson(res, 200, {
-      ok: true,
-      ...agentSessions.snapshot()
-    });
-    return;
-  }
-
-  if (url.pathname === "/sessions/clear" && req.method === "POST") {
-    const snapshot = agentSessions.clear();
-    if (agentReturnTimer) {
-      clearTimeout(agentReturnTimer);
-      agentReturnTimer = null;
-    }
-    clearAgentReviewDebounce();
-    broadcastState({ state: "idle", message: "", source: null, sessionId: null, agentEvent: "clear", sessions: [] });
-    sendJson(res, 200, { ok: true, ...snapshot });
-    return;
-  }
-
-  if (url.pathname === "/settings/open" && req.method === "POST") {
-    createSettingsWindow();
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
-  if (url.pathname === "/window/resize" && req.method === "POST") {
-    const body = await parseJsonBody(req);
-    sendJson(res, 200, resizePetWindow(body.zoom));
-    return;
-  }
-
-  if (url.pathname === "/bubble/resize" && req.method === "POST") {
-    const body = await parseJsonBody(req);
-    sendJson(res, 200, resizeBubble(body.bubbleScale || body.scale));
-    return;
-  }
-
-  if (url.pathname === "/pet/select" && req.method === "POST") {
-    const body = await parseJsonBody(req);
-    if (!selectPet(String(body.id || body.key || ""), body.source)) {
-      sendJson(res, 404, { ok: false, error: "Pet not found" });
-      return;
-    }
-    sendJson(res, 200, { ok: true, activePet: toPetPayload(activePet) });
-    return;
-  }
-
-  if (url.pathname === "/events" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      const decision = buildDecision(body);
-
-      if (!decision) {
-        sendJson(res, 202, {
-          ok: true,
-          ignored: true,
-          reason: "Unknown or unsupported event",
-          received: {
-            source: body.source || body.agent || body.agentId || null,
-            event: body.event || body.type || body.hook_event_name || body.reaction || null
-          }
-        });
-        return;
-      }
-
-      if (body.petId || body.petKey) {
-        selectPet(String(body.petId || body.petKey), body.petSource);
-      }
-
-      recordHookEvent(decision);
-      if (decision.source !== getActiveHookAgent()) {
-        sendJson(res, 202, {
-          ok: true,
-          ignored: true,
-          reason: `Inactive hook source. Listening to ${getActiveHookAgent()}.`,
-          decision,
-          activeHookAgent: getActiveHookAgent(),
-          hooks: getHookStatus()
-        });
-        return;
-      }
-
-      const result = applyAgentDecision(decision);
-      sendJson(res, 200, {
-        ok: true,
-        decision,
-        display: result.display,
-        aggregate: result.aggregate,
-        sessions: result.sessions,
-        activePet: toPetPayload(activePet)
-      });
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message });
-    }
-    return;
-  }
-
-  if (url.pathname === "/permission" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      const source = normalizeHookAgent(url.searchParams.get("source") || body.source || "codebuddy");
-      const decision = buildDecision({
-        ...body,
-        source,
-        hook_event_name: body.hook_event_name || body.event || "PermissionRequest"
-      });
-
-      if (decision) {
-        recordHookEvent(decision);
-        if (decision.source === getActiveHookAgent()) {
-          applyAgentDecision(decision);
-        }
-      }
-
-      sendJson(res, 200, {
-        ok: true,
-        decision: "allow",
-        activeHookAgent: getActiveHookAgent()
-      });
-    } catch (error) {
-      sendJson(res, 200, {
-        ok: false,
-        decision: "allow",
-        error: error.message
-      });
-    }
-    return;
-  }
-
-  if (url.pathname === "/state" && req.method === "GET") {
-    sendJson(res, 200, {
-      ...currentState,
-      agentSessions: agentSessions.snapshot(),
-      activePet: toPetPayload(activePet)
-    });
-    return;
-  }
-
-  if (url.pathname === "/state" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      const state = typeof body.state === "string" ? body.state : "idle";
-      const message = typeof body.message === "string" ? body.message.slice(0, 120) : "";
-      const durationMs = Number.isFinite(Number(body.durationMs)) ? Number(body.durationMs) : 0;
-
-      if (body.petId || body.petKey) {
-        selectPet(String(body.petId || body.petKey), body.petSource);
-      }
-
-      if (!VALID_STATES.has(state)) {
-        sendJson(res, 400, {
-          ok: false,
-          error: `Invalid state. Use one of: ${Array.from(VALID_STATES).join(", ")}`
-        });
-        return;
-      }
-
-      broadcastState({ state, message });
-
-      if (durationMs > 0) {
-        setTimeout(() => {
-          if (currentState.state === state) {
-            broadcastState({ state: "idle", message: "Ready" });
-          }
-        }, Math.min(durationMs, 60_000));
-      }
-
-      sendJson(res, 200, {
-        ok: true,
-        state: currentState,
-        activePet: toPetPayload(activePet)
-      });
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message });
-    }
-    return;
-  }
-
-  // ---- Reminder API ----
-
-  if (url.pathname === "/reminders" && req.method === "GET") {
-    sendJson(res, 200, { ok: true, reminders: reminderManager ? reminderManager.getStatus() : null });
-    return;
-  }
-
-  if (url.pathname === "/reminders/config" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      if (!reminderManager) {
-        sendJson(res, 503, { ok: false, error: "Reminder manager not initialized" });
-        return;
-      }
-      const result = reminderManager.updateConfig(body);
-      sendJson(res, result.ok ? 200 : 400, result);
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message });
-    }
-    return;
-  }
-
-  if (url.pathname === "/reminders/trigger" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      if (!reminderManager) {
-        sendJson(res, 503, { ok: false, error: "Reminder manager not initialized" });
-        return;
-      }
-      const result = reminderManager.triggerNow(body.typeId || body.id);
-      sendJson(res, result.ok ? 200 : 400, result);
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message });
-    }
-    return;
-  }
-
-  if (url.pathname === "/reminders/reset" && req.method === "POST") {
-    try {
-      const body = await parseJsonBody(req);
-      if (!reminderManager) {
-        sendJson(res, 503, { ok: false, error: "Reminder manager not initialized" });
-        return;
-      }
-      const result = reminderManager.reset(body.typeId || body.id);
-      sendJson(res, result.ok ? 200 : 400, result);
-    } catch (error) {
-      sendJson(res, 400, { ok: false, error: error.message });
-    }
-    return;
-  }
-
-  sendJson(res, 404, { ok: false, error: "Not found" });
-}
-
-function createApiServer() {
-  server = http.createServer((req, res) => {
-    handleApiRequest(req, res).catch((error) => {
-      sendJson(res, 500, { ok: false, error: error.message });
-    });
-  });
-
-  server.listen(API_PORT, API_HOST, () => {
-    console.log(`Desktop pet API listening on http://${API_HOST}:${API_PORT}`);
-  });
+  return [
+    ...items,
+    { type: "separator" },
+    { label: "重新加载宠物", click: () => reloadPets() },
+    { label: "打开 Codex 宠物目录", click: () => openCodexPetsFolder() }
+  ];
 }
 
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
     {
-      label: "Show / Hide",
+      label: "显示 / 隐藏桌宠",
       click: () => {
-        if (!win) return;
-        win.isVisible() ? win.hide() : win.show();
+        if (!petWindow || petWindow.isDestroyed()) return;
+        petWindow.isVisible() ? petWindow.hide() : petWindow.show();
       }
     },
-    {
-      label: "Settings",
-      click: () => createSettingsWindow()
-    },
-    {
-      label: "免打扰模式",
-      type: "checkbox",
-      checked: reminderManager ? reminderManager.getConfig().quietMode : false,
-      click: (menuItem) => {
-        if (!reminderManager) return;
-        reminderManager.updateConfig({ quietMode: menuItem.checked });
-        saveSettings();
-      }
-    },
-    {
-      type: "separator"
-    },
-    {
-      label: "Check for Updates",
-      click: () => checkForUpdates(true)
-    },
-    {
-      type: "separator"
-    },
-    {
-      label: "Idle",
-      click: () => broadcastState({ state: "idle", message: "Ready" })
-    },
-    {
-      label: "Running",
-      click: () => broadcastState({ state: "running", message: "Task running" })
-    },
-    {
-      label: "Waiting",
-      click: () => broadcastState({ state: "waiting", message: "Waiting for input" })
-    },
-    {
-      label: "Quit",
-      click: () => app.quit()
-    }
+    { label: "宠物", submenu: petTrayItems() },
+    { type: "separator" },
+    { label: "退出 TaskPet", click: () => app.quit() }
   ]);
 }
 
@@ -1378,8 +245,66 @@ function rebuildTrayMenu() {
 function createTray() {
   const icon = createAppIcon().resize({ width: 16, height: 16 });
   tray = new Tray(icon);
-  tray.setToolTip("Desktop Pet Agent");
+  tray.setToolTip(APP_NAME);
   tray.setContextMenu(buildTrayMenu());
+  tray.on("click", () => {
+    if (!petWindow || petWindow.isDestroyed()) return;
+    petWindow.isVisible() ? petWindow.hide() : petWindow.show();
+  });
+}
+
+function registerIpcHandlers() {
+  ipcMain.handle("taskpet:get-initial-state", (event) => isPetWindowSender(event) ? ({
+    ...petStatePayload(),
+    config: {
+      zoom: clampZoom(settings.zoom),
+      minZoom: MIN_ZOOM,
+      maxZoom: MAX_ZOOM,
+      baseWindowWidth: BASE_WINDOW_WIDTH,
+      baseWindowHeight: BASE_WINDOW_HEIGHT
+    }
+  }) : null);
+
+  ipcMain.handle("taskpet:get-window-bounds", (event) => {
+    if (!isPetWindowSender(event)) return null;
+    return petWindow.getBounds();
+  });
+
+  ipcMain.handle("taskpet:move-window", (event, point) => {
+    if (!isPetWindowSender(event) || !point || typeof point !== "object") return false;
+    const x = Math.round(Number(point.x));
+    const y = Math.round(Number(point.y));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    petWindow.setPosition(x, y);
+    return true;
+  });
+
+  ipcMain.handle("taskpet:resize-window", (event, payload) => {
+    if (!isPetWindowSender(event)) return { ok: false };
+    const zoom = Number(payload?.zoom);
+    if (!Number.isFinite(zoom)) return { ok: false };
+    return resizePetWindow(zoom);
+  });
+
+  ipcMain.handle("taskpet:finish-drag", (event) => {
+    if (!isPetWindowSender(event)) return false;
+    saveWindowBounds();
+    petState.finishDrag();
+    return true;
+  });
+
+  ipcMain.on("taskpet:drag-direction", (event, direction) => {
+    if (!isPetWindowSender(event) || (direction !== "drag-left" && direction !== "drag-right")) return;
+    petState.startDrag(direction);
+  });
+
+  ipcMain.on("taskpet:renderer-ready", (event) => {
+    if (!IS_SMOKE_TEST || !petWindow || event.sender !== petWindow.webContents) return;
+    clearTimeout(smokeTimeout);
+    smokeTimeout = null;
+    console.log("TaskPet smoke test ready");
+    setTimeout(() => app.quit(), 100);
+  });
 }
 
 function configureMacMenuBarMode() {
@@ -1389,199 +314,34 @@ function configureMacMenuBarMode() {
 }
 
 app.whenReady().then(() => {
-  app.setName("Desktop Pet Agent");
   configureMacMenuBarMode();
-  if (process.platform === "win32") app.setAppUserModelId("com.desktop-pet-agent.app");
+  if (process.platform === "win32") app.setAppUserModelId(APP_ID);
   loadSettings();
   discoverPets();
-  setupAutoUpdater();
-  createWindow();
-  createBubbleWindow();
+  registerIpcHandlers();
+  createPetWindow();
   createTray();
-  createApiServer();
-
-  reminderManager = new ReminderManager({
-    reminders: settings.reminders,
-    save: (config) => {
-      settings.reminders = config;
-      saveSettings();
-      rebuildTrayMenu();
-    },
-    onTrigger: ({ typeId, label, state, message, durationSeconds }) => {
-      broadcastState({ state, message });
-      if (durationSeconds > 0) {
-        setTimeout(() => {
-          broadcastState({ state: "idle", message: "" });
-        }, durationSeconds * 1000);
-      }
-    }
-  });
-  reminderManager.start();
-
-  ipcMain.handle("pet:get-initial-state", () => buildInitialPayload());
-  ipcMain.handle("pet:list-pets", () => {
-    discoverPets();
-    return {
-      ok: true,
-      pets: pets.map(toPetPayload),
-      activePet: toPetPayload(activePet),
-      actions: ACTIONS,
-      storage: getPetStorageInfo()
-    };
-  });
-  ipcMain.handle("pet:get-hook-status", () => {
-    return { ok: true, hooks: getHookStatus() };
-  });
-  ipcMain.handle("pet:get-update-status", () => {
-    return { ok: true, update: getUpdateStatus() };
-  });
-  ipcMain.handle("pet:check-for-updates", async () => {
-    return { ok: true, update: await checkForUpdates(true) };
-  });
-  ipcMain.handle("pet:install-update", () => {
-    return { ok: true, update: installDownloadedUpdate() };
-  });
-  ipcMain.handle("pet:open-releases", async () => {
-    await shell.openExternal(RELEASES_URL);
-    return { ok: true };
-  });
-  ipcMain.handle("pet:install-hooks", (_event, payload) => {
-    try {
-      return installHookAgent(payload?.agent);
-    } catch (error) {
-      return { ok: false, error: error.message, hooks: getHookStatus() };
-    }
-  });
-  ipcMain.handle("pet:select-hook-agent", (_event, payload) => {
-    try {
-      return selectHookAgent(payload?.agent);
-    } catch (error) {
-      return { ok: false, error: error.message, activeHookAgent: getActiveHookAgent(), hooks: getHookStatus() };
-    }
-  });
-  ipcMain.handle("pet:select-pet", (_event, payload) => {
-    const ok = selectPet(String(payload?.id || payload?.key || ""), payload?.source);
-    return { ok, activePet: toPetPayload(activePet), pets: pets.map(toPetPayload) };
-  });
-  ipcMain.handle("pet:select-storage", (_event, payload) => {
-    try {
-      return selectPetStorage(payload?.storage, payload?.customDir);
-    } catch (error) {
-      return { ok: false, error: error.message, storage: getPetStorageInfo(), pets: pets.map(toPetPayload), activePet: toPetPayload(activePet) };
-    }
-  });
-  ipcMain.handle("pet:choose-custom-storage", async () => {
-    try {
-      return await chooseCustomPetStorage();
-    } catch (error) {
-      return { ok: false, error: error.message, storage: getPetStorageInfo(), pets: pets.map(toPetPayload), activePet: toPetPayload(activePet) };
-    }
-  });
-  ipcMain.handle("pet:open-folder", async (_event, payload) => {
-    try {
-      return await openPetFolder(payload?.kind);
-    } catch (error) {
-      return { ok: false, error: error.message, storage: getPetStorageInfo() };
-    }
-  });
-  ipcMain.handle("pet:set-state", (_event, payload) => {
-    const state = String(payload?.state || "idle");
-    if (!VALID_STATES.has(state)) return { ok: false, error: "Invalid state" };
-    const durationMs = Number.isFinite(Number(payload?.durationMs)) ? Number(payload.durationMs) : 0;
-    broadcastState({
-      state,
-      message: typeof payload?.message === "string" ? payload.message.slice(0, 120) : ""
-    });
-    if (durationMs > 0) {
-      const returnState = typeof payload?.returnState === "string" && VALID_STATES.has(payload.returnState)
-        ? payload.returnState
-        : "idle";
-      setTimeout(() => {
-        if (currentState.state === state) {
-          broadcastState({ state: returnState, message: "" });
-        }
-      }, Math.min(durationMs, 60_000));
-    }
-    return { ok: true, state: currentState };
-  });
-  ipcMain.handle("pet:get-window-bounds", () => {
-    if (!win || win.isDestroyed()) return null;
-    return win.getBounds();
-  });
-  ipcMain.handle("pet:get-window-placement", () => getWindowPlacement());
-  ipcMain.handle("pet:move-window", (_event, point) => {
-    if (!win || win.isDestroyed() || !point) return false;
-    const x = Math.round(Number(point.x));
-    const y = Math.round(Number(point.y));
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
-    win.setPosition(x, y);
-    positionBubble();
-    return true;
-  });
-  ipcMain.handle("pet:resize-window", (_event, payload) => {
-    return resizePetWindow(payload?.zoom);
-  });
-  ipcMain.handle("pet:resize-bubble", (_event, payload) => {
-    return resizeBubble(payload?.bubbleScale || payload?.scale);
-  });
-  ipcMain.handle("bubble:measure", (_event, size) => {
-    positionBubble(size);
-    if (bubbleWin && !bubbleWin.isDestroyed() && currentState.message) {
-      bubbleWin.showInactive();
-    }
-    return true;
-  });
-  ipcMain.handle("pet:finish-drag", () => {
-    if (win && !win.isDestroyed()) {
-      settings.windowBounds = win.getBounds();
-      saveSettings();
-    }
-
-    if (stateBeforeDrag) {
-      broadcastState(stateBeforeDrag);
-      stateBeforeDrag = null;
-    } else {
-      broadcastState({ state: "idle", message: "" });
-    }
-    return true;
-  });
-  ipcMain.on("pet:drag-direction", (_event, state) => {
-    if (!["running-left", "running-right"].includes(state)) return;
-    if (!stateBeforeDrag) stateBeforeDrag = { ...currentState };
-    if (normalizeState(currentState.state) !== state) {
-      broadcastState({ state, message: "" });
-    }
-  });
-  ipcMain.on("pet:open-settings", () => createSettingsWindow());
-
-  ipcMain.handle("pet:get-reminders", () => {
-    return { ok: true, reminders: reminderManager ? reminderManager.getStatus() : null };
-  });
-  ipcMain.handle("pet:update-reminder-config", (_event, payload) => {
-    if (!reminderManager) return { ok: false, error: "Reminder engine not ready" };
-    return reminderManager.updateConfig(payload);
-  });
-  ipcMain.handle("pet:trigger-reminder", (_event, payload) => {
-    if (!reminderManager) return { ok: false, error: "Reminder engine not ready" };
-    return reminderManager.triggerNow(payload?.typeId || payload?.id);
-  });
-  ipcMain.handle("pet:reset-reminders", (_event, payload) => {
-    if (!reminderManager) return { ok: false, error: "Reminder engine not ready" };
-    return reminderManager.reset(payload?.typeId || payload?.id);
-  });
-
-  setTimeout(() => {
-    checkForUpdates(false).catch((error) => {
-      console.warn(`Silent update check failed: ${error.message}`);
-    });
-  }, 5000);
+  if (IS_SMOKE_TEST) {
+    smokeTimeout = setTimeout(() => {
+      console.error("TaskPet smoke test timed out before renderer initialization");
+      app.exit(1);
+    }, 10_000);
+  }
+}).catch((error) => {
+  console.error(`TaskPet failed to start: ${error.stack || error.message}`);
+  app.exit(1);
 });
 
-app.on("window-all-closed", (event) => {
-  event.preventDefault();
+app.on("activate", () => {
+  if (!petWindow) createPetWindow();
+  else petWindow.show();
+});
+
+app.on("window-all-closed", () => {
+  // The tray owns the application lifecycle; quitting is explicit from its menu.
 });
 
 app.on("before-quit", () => {
-  if (reminderManager) reminderManager.stop();
-  if (server) server.close();
+  clearTimeout(smokeTimeout);
+  saveWindowBounds();
 });

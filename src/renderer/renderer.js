@@ -4,35 +4,29 @@ const sprite = document.getElementById("sprite");
 const fallback = document.getElementById("fallback");
 const resizeHandle = document.getElementById("resizeHandle");
 
-const CELL_WIDTH = 192;
-const CELL_HEIGHT = 208;
+const DEFAULT_FRAME = Object.freeze({ width: 192, height: 208, columns: 8, rows: 9 });
 const BASE_SPRITE_SCALE = 0.86;
 const BASE_WINDOW_WIDTH = 240;
 const BASE_WINDOW_HEIGHT = 286;
-let minZoom = 0.65;
-let maxZoom = 2.4;
-
-const ROWS = {
+const ALLOWED_STATES = new Set([
+  "idle",
+  "working",
+  "done",
+  "attention",
+  "drag-left",
+  "drag-right"
+]);
+const DEFAULT_ANIMATIONS = {
   idle: { row: 0, durations: [280, 110, 110, 140, 140, 320] },
-  "running-right": { row: 1, durations: [120, 120, 120, 120, 120, 120, 120, 220] },
-  "running-left": { row: 2, durations: [120, 120, 120, 120, 120, 120, 120, 220] },
-  waving: { row: 3, durations: [140, 140, 140, 280] },
-  jumping: { row: 4, durations: [140, 140, 140, 140, 280] },
-  failed: { row: 5, durations: [140, 140, 140, 140, 140, 140, 140, 240] },
-  waiting: { row: 6, durations: [150, 150, 150, 150, 150, 260] },
-  running: { row: 7, durations: [120, 120, 120, 120, 120, 220] },
-  review: { row: 8, durations: [150, 150, 150, 150, 150, 280] }
+  "drag-right": { row: 1, durations: [120, 120, 120, 120, 120, 120, 120, 220] },
+  "drag-left": { row: 2, durations: [120, 120, 120, 120, 120, 120, 120, 220] },
+  attention: { row: 3, durations: [140, 140, 140, 280] },
+  done: { row: 4, durations: [140, 140, 140, 140, 280] },
+  working: { row: 7, durations: [120, 120, 120, 120, 120, 220] }
 };
 
-const STATE_ALIASES = {
-  start: "waving",
-  success: "jumping",
-  done: "jumping",
-  sleeping: "failed",
-  working: "running",
-  thinking: "review"
-};
-
+let animations = { ...DEFAULT_ANIMATIONS };
+let frame = { ...DEFAULT_FRAME };
 let currentPet = null;
 let currentState = "idle";
 let frameIndex = 0;
@@ -40,22 +34,52 @@ let frameTimer = null;
 let dragStart = null;
 let lastDragDirection = null;
 let zoom = 1;
+let minZoom = 0.65;
+let maxZoom = 2.4;
 let resizeStart = null;
 let hideResizeTimer = null;
-let bubbleScale = 1;
-let clickCandidate = null;
 
 function normalizeState(state) {
-  const requested = state || "idle";
-  return STATE_ALIASES[requested] || requested;
+  return ALLOWED_STATES.has(state) ? state : "idle";
 }
 
 function clampZoom(value) {
-  return Math.max(minZoom, Math.min(maxZoom, value));
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.max(minZoom, Math.min(maxZoom, numeric));
+}
+
+function positiveInteger(value, fallback, minimum = 1) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= minimum ? numeric : fallback;
+}
+
+function applyFrame(nextFrame = {}) {
+  frame = {
+    width: positiveInteger(nextFrame.width, DEFAULT_FRAME.width),
+    height: positiveInteger(nextFrame.height, DEFAULT_FRAME.height),
+    columns: positiveInteger(nextFrame.columns, DEFAULT_FRAME.columns, 8),
+    rows: positiveInteger(nextFrame.rows, DEFAULT_FRAME.rows, 8)
+  };
+}
+
+function applyAnimations(actions) {
+  if (!Array.isArray(actions)) return;
+  const next = { ...DEFAULT_ANIMATIONS };
+  for (const action of actions) {
+    if (!ALLOWED_STATES.has(action?.state)) continue;
+    const row = Number(action.row);
+    const durations = Array.isArray(action.durations)
+      ? action.durations.map(Number).filter((duration) => Number.isFinite(duration) && duration > 0)
+      : [];
+    if (!Number.isInteger(row) || row < 0 || durations.length === 0) continue;
+    next[action.state] = { row, durations };
+  }
+  animations = next;
 }
 
 function applyZoom(nextZoom) {
-  zoom = clampZoom(nextZoom || 1);
+  zoom = clampZoom(nextZoom);
   document.documentElement.style.setProperty("--zoom", String(zoom));
   document.documentElement.style.setProperty("--pet-left", `${36 * zoom}px`);
   document.documentElement.style.setProperty("--pet-bottom", `${12 * zoom}px`);
@@ -68,47 +92,38 @@ function applyZoom(nextZoom) {
   drawFrame();
 }
 
-function applyBubbleScale(nextScale) {
-  bubbleScale = Number.isFinite(Number(nextScale)) ? Number(nextScale) : 1;
-  bubbleScale = Math.max(0.75, Math.min(1.6, bubbleScale));
-}
-
 function getAtlasScale() {
   return BASE_SPRITE_SCALE * zoom;
 }
 
 function updateSpriteMetrics() {
   const atlasScale = getAtlasScale();
-  sprite.style.width = `${CELL_WIDTH * atlasScale}px`;
-  sprite.style.height = `${CELL_HEIGHT * atlasScale}px`;
-  sprite.style.backgroundSize = `${CELL_WIDTH * 8 * atlasScale}px ${CELL_HEIGHT * 9 * atlasScale}px`;
+  sprite.style.width = `${frame.width * atlasScale}px`;
+  sprite.style.height = `${frame.height * atlasScale}px`;
+  sprite.style.backgroundSize = `${frame.width * frame.columns * atlasScale}px ${frame.height * frame.rows * atlasScale}px`;
 }
 
 function drawFrame() {
-  const rowDef = ROWS[currentState] || ROWS.idle;
+  const animation = animations[currentState] || animations.idle;
   const atlasScale = getAtlasScale();
-  const x = -(frameIndex * CELL_WIDTH * atlasScale);
-  const y = -(rowDef.row * CELL_HEIGHT * atlasScale);
-
+  const x = -(frameIndex * frame.width * atlasScale);
+  const y = -(animation.row * frame.height * atlasScale);
   sprite.style.backgroundPosition = `${x}px ${y}px`;
 }
 
 function scheduleNextFrame() {
   clearTimeout(frameTimer);
-
-  const rowDef = ROWS[currentState] || ROWS.idle;
-  const duration = rowDef.durations[frameIndex] || 160;
-
+  const animation = animations[currentState] || animations.idle;
+  const duration = animation.durations[frameIndex] || 160;
   frameTimer = setTimeout(() => {
-    frameIndex = (frameIndex + 1) % rowDef.durations.length;
+    frameIndex = (frameIndex + 1) % animation.durations.length;
     drawFrame();
     scheduleNextFrame();
   }, duration);
 }
 
 function setAnimationState(state) {
-  const normalized = normalizeState(state);
-  currentState = ROWS[normalized] ? normalized : "idle";
+  currentState = normalizeState(state);
   frameIndex = 0;
   pet.dataset.state = currentState;
   if (currentState !== "idle" && !resizeStart) {
@@ -120,6 +135,7 @@ function setAnimationState(state) {
 
 function setPet(petPayload) {
   currentPet = petPayload || null;
+  applyFrame(currentPet?.frame);
 
   if (!currentPet?.spritesheetUrl) {
     sprite.classList.remove("ready");
@@ -135,34 +151,28 @@ function setPet(petPayload) {
 }
 
 function setPetState(payload) {
-  if (payload?.activePet && payload.activePet?.key !== currentPet?.key) {
+  if (payload?.activePet && payload.activePet.key !== currentPet?.key) {
     setPet(payload.activePet);
   }
-
-  setAnimationState(payload?.normalizedState || payload?.state || "idle");
+  setAnimationState(payload?.state);
 }
 
 async function startDrag(event) {
-  if (event.button !== 0) return;
-  if (event.target.closest("#resizeHandle")) return;
-  const bounds = await window.desktopPet.getWindowBounds();
-  if (!bounds) return;
+  if (event.button !== 0 || event.target.closest("#resizeHandle")) return;
+  const pointerId = event.pointerId;
+  pet.setPointerCapture(pointerId);
+  const bounds = await window.taskPet.getWindowBounds();
+  if (!bounds || !pet.hasPointerCapture(pointerId)) return;
 
   dragStart = {
-    pointerId: event.pointerId,
+    pointerId,
     startScreenX: event.screenX,
     startScreenY: event.screenY,
     lastScreenX: event.screenX,
     windowX: bounds.x,
     windowY: bounds.y
   };
-  clickCandidate = {
-    screenX: event.screenX,
-    screenY: event.screenY,
-    startedAt: Date.now()
-  };
   lastDragDirection = null;
-  pet.setPointerCapture(event.pointerId);
 }
 
 function moveDrag(event) {
@@ -172,40 +182,24 @@ function moveDrag(event) {
   const stepX = event.screenX - dragStart.lastScreenX;
   dragStart.lastScreenX = event.screenX;
 
-  window.desktopPet.moveWindow({
+  window.taskPet.moveWindow({
     x: dragStart.windowX + dx,
     y: dragStart.windowY + dy
   });
 
   if (Math.abs(stepX) < 1) return;
-  const direction = stepX > 0 ? "running-right" : "running-left";
+  const direction = stepX > 0 ? "drag-right" : "drag-left";
   if (direction !== lastDragDirection) {
     lastDragDirection = direction;
-    window.desktopPet.setDragDirection(direction);
+    window.taskPet.setDragDirection(direction);
   }
 }
 
 function endDrag(event) {
   if (!dragStart || event.pointerId !== dragStart.pointerId) return;
-  const movedX = Math.abs(event.screenX - dragStart.startScreenX);
-  const movedY = Math.abs(event.screenY - dragStart.startScreenY);
-  const elapsed = clickCandidate ? Date.now() - clickCandidate.startedAt : Infinity;
-  const isClick = movedX <= 4 && movedY <= 4 && elapsed <= 500;
   dragStart = null;
   lastDragDirection = null;
-  clickCandidate = null;
-
-  if (isClick) {
-    window.desktopPet.setState({
-      state: "jumping",
-      message: "",
-      durationMs: 900,
-      returnState: currentState
-    });
-    return;
-  }
-
-  window.desktopPet.finishDrag();
+  window.taskPet.finishDrag();
 }
 
 function showResizeHandle() {
@@ -226,19 +220,18 @@ async function startResize(event) {
   event.preventDefault();
   event.stopPropagation();
 
-  const bounds = await window.desktopPet.getWindowBounds();
-  if (!bounds) return;
-
+  const pointerId = event.pointerId;
+  resizeHandle.setPointerCapture(pointerId);
+  const bounds = await window.taskPet.getWindowBounds();
+  if (!bounds || !resizeHandle.hasPointerCapture(pointerId)) return;
   resizeStart = {
-    pointerId: event.pointerId,
+    pointerId,
     startScreenX: event.screenX,
     startScreenY: event.screenY,
     width: bounds.width,
-    height: bounds.height,
-    zoom
+    height: bounds.height
   };
   showResizeHandle();
-  resizeHandle.setPointerCapture(event.pointerId);
 }
 
 function moveResize(event) {
@@ -248,12 +241,11 @@ function moveResize(event) {
 
   const dx = event.screenX - resizeStart.startScreenX;
   const dy = event.screenY - resizeStart.startScreenY;
-  const nextWidthZoom = (resizeStart.width + dx) / BASE_WINDOW_WIDTH;
-  const nextHeightZoom = (resizeStart.height + dy) / BASE_WINDOW_HEIGHT;
-  const nextZoom = clampZoom(Math.max(nextWidthZoom, nextHeightZoom));
-
+  const widthZoom = (resizeStart.width + dx) / BASE_WINDOW_WIDTH;
+  const heightZoom = (resizeStart.height + dy) / BASE_WINDOW_HEIGHT;
+  const nextZoom = clampZoom(Math.max(widthZoom, heightZoom));
   applyZoom(nextZoom);
-  window.desktopPet.resizeWindow({ zoom: nextZoom });
+  window.taskPet.resizeWindow({ zoom: nextZoom });
 }
 
 function endResize(event) {
@@ -264,24 +256,27 @@ function endResize(event) {
   hideResizeHandleSoon();
 }
 
-window.desktopPet.getInitialState().then((initial) => {
+window.taskPet.getInitialState().then((initial) => {
   const config = initial?.config || {};
   minZoom = Number(config.minZoom) || minZoom;
   maxZoom = Number(config.maxZoom) || maxZoom;
+  applyAnimations(initial?.actions);
   applyZoom(Number(config.zoom) || 1);
-  applyBubbleScale(Number(config.bubbleScale) || 1);
   setPet(initial?.activePet);
   setPetState(initial);
+  window.taskPet.rendererReady();
+}).catch((error) => {
+  console.error(`Failed to initialize TaskPet renderer: ${error.message}`);
+  fallback.classList.add("show");
 });
-window.desktopPet.onPetChange(setPet);
-window.desktopPet.onStateChange(setPetState);
-window.desktopPet.onZoomChange((payload) => applyZoom(Number(payload?.zoom) || zoom));
-window.desktopPet.onBubbleScaleChange((payload) => applyBubbleScale(Number(payload?.bubbleScale) || bubbleScale));
+
+window.taskPet.onPetChange(setPet);
+window.taskPet.onStateChange(setPetState);
+window.taskPet.onZoomChange((payload) => applyZoom(payload?.zoom));
 pet.addEventListener("pointerdown", startDrag);
 pet.addEventListener("pointermove", moveDrag);
 pet.addEventListener("pointerup", endDrag);
 pet.addEventListener("pointercancel", endDrag);
-pet.addEventListener("dblclick", () => window.desktopPet.openSettings());
 pet.addEventListener("pointerenter", showResizeHandle);
 pet.addEventListener("pointerleave", hideResizeHandleSoon);
 resizeHandle.addEventListener("pointerenter", showResizeHandle);

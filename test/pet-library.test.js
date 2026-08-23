@@ -4,25 +4,29 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {
+  DEFAULT_PET_FRAME,
   discoverPets,
   getActivePetsRoot,
-  sanitizeId
+  normalizePetFrame,
+  sanitizeId,
+  toPetPayload
 } = require("../src/pet-library");
 
 const WEBP = Buffer.from("RIFF\x10\x00\x00\x00WEBPVP8 ", "binary");
 
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "desktop-pet-test-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "taskpet-test-"));
 }
 
-function writePet(root, id) {
+function writePet(root, id, manifestPatch = {}) {
   const dir = path.join(root, id);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "spritesheet.webp"), WEBP);
   fs.writeFileSync(path.join(dir, "pet.json"), JSON.stringify({
     id,
     displayName: `Pet ${id}`,
-    spritesheetPath: "spritesheet.webp"
+    spritesheetPath: "spritesheet.webp",
+    ...manifestPatch
   }));
 }
 
@@ -95,4 +99,36 @@ test("getActivePetsRoot falls back to .codex when custom folder is missing", () 
 
 test("sanitizeId keeps ids filesystem-safe", () => {
   assert.equal(sanitizeId("hello / world"), "hello-world");
+});
+
+test("Codex-compatible frame geometry is the default", () => {
+  assert.deepEqual(normalizePetFrame(), DEFAULT_PET_FRAME);
+  assert.deepEqual(normalizePetFrame({ width: -1, columns: 4, rows: 7 }), DEFAULT_PET_FRAME);
+});
+
+test("pet manifests can provide explicit frame geometry", () => {
+  const root = tempDir();
+  const petsRoot = path.join(root, ".codex", "pets");
+  writePet(petsRoot, "wide", {
+    frame: { width: 96, height: 104, columns: 8, rows: 9 }
+  });
+
+  const [pet] = discoverPets(petsRoot);
+  assert.deepEqual(pet.frame, { width: 96, height: 104, columns: 8, rows: 9 });
+
+  const payload = toPetPayload(pet);
+  assert.deepEqual(payload.frame, pet.frame);
+  assert.match(payload.spritesheetUrl, /^file:/);
+  assert.equal("root" in payload, false);
+  assert.equal("spritesheetPath" in payload, false);
+});
+
+test("pet manifests cannot load a spritesheet outside their package", () => {
+  const root = tempDir();
+  const petsRoot = path.join(root, "pets");
+  fs.mkdirSync(petsRoot, { recursive: true });
+  fs.writeFileSync(path.join(petsRoot, "outside.webp"), WEBP);
+  writePet(petsRoot, "unsafe", { spritesheetPath: "../outside.webp" });
+
+  assert.deepEqual(discoverPets(petsRoot), []);
 });

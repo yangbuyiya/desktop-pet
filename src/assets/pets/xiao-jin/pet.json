@@ -2,5 +2,11 @@
   "id": "xiao-jin",
   "displayName": "小锦",
   "description": "根据参考图创建的 Codex 电子宠物：小锦，深棕侧马尾、白色深蓝领运动衫风格，清晰小尺寸轮廓。",
-  "spritesheetPath": "spritesheet.webp"
+  "spritesheetPath": "spritesheet.webp",
+  "frame": {
+    "width": 192,
+    "height": 208,
+    "columns": 8,
+    "rows": 9
+  }
 }

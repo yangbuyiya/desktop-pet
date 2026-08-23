@@ -2,6 +2,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
+const DEFAULT_PET_FRAME = Object.freeze({
+  width: 192,
+  height: 208,
+  columns: 8,
+  rows: 9
+});
+
 const STORAGE_LABELS = {
   codex: ".codex 宠物",
   custom: "自定义文件夹"
@@ -37,6 +44,27 @@ function sanitizeId(input, fallback = "pet") {
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
   return base || fallback;
+}
+
+function positiveInteger(value, fallback, minimum = 1) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= minimum ? number : fallback;
+}
+
+function normalizePetFrame(frame = {}) {
+  return {
+    width: positiveInteger(frame.width, DEFAULT_PET_FRAME.width),
+    height: positiveInteger(frame.height, DEFAULT_PET_FRAME.height),
+    columns: positiveInteger(frame.columns, DEFAULT_PET_FRAME.columns, 8),
+    rows: positiveInteger(frame.rows, DEFAULT_PET_FRAME.rows, 8)
+  };
+}
+
+function resolveSpritesheetPath(directory, manifestPath) {
+  const spritesheetPath = path.resolve(directory, manifestPath || "spritesheet.webp");
+  const relative = path.relative(directory, spritesheetPath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return "";
+  return spritesheetPath;
 }
 
 function getPetStorageRoots({ codexHome, customPetsDir }) {
@@ -76,9 +104,9 @@ function discoverPetsInDirectory(petsRoot, source = "pets") {
     .map((dir) => {
       const manifest = readJson(path.join(dir, "pet.json")) || {};
       const id = String(manifest.id || path.basename(dir));
-      const spritesheetPath = path.resolve(dir, manifest.spritesheetPath || "spritesheet.webp");
+      const spritesheetPath = resolveSpritesheetPath(dir, manifest.spritesheetPath);
 
-      if (!fs.existsSync(spritesheetPath)) return null;
+      if (!spritesheetPath || !fs.existsSync(spritesheetPath)) return null;
 
       return {
         id,
@@ -88,7 +116,8 @@ function discoverPetsInDirectory(petsRoot, source = "pets") {
         source,
         sourceLabel: PET_SOURCE_LABELS[source] || source,
         root: dir,
-        spritesheetPath
+        spritesheetPath,
+        frame: normalizePetFrame(manifest.frame)
       };
     })
     .filter(Boolean);
@@ -113,15 +142,16 @@ function toPetPayload(pet) {
     description: pet.description,
     source: pet.source,
     sourceLabel: pet.sourceLabel,
-    root: pet.root,
-    spritesheetPath: pet.spritesheetPath,
-    spritesheetUrl: pathToFileURL(pet.spritesheetPath).toString()
+    spritesheetUrl: pathToFileURL(pet.spritesheetPath).toString(),
+    frame: { ...pet.frame }
   };
 }
 
 module.exports = {
+  DEFAULT_PET_FRAME,
   discoverPets,
   getActivePetsRoot,
+  normalizePetFrame,
   sanitizeId,
   toPetPayload
 };
